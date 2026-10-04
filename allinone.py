@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """
 مفكك Luraph AI — نظام كامل في ملف واحد.
-FastAPI + SQLite + asyncio background workers + AI report. بلا Redis، بلا Celery.
+FastAPI + SQLite + asyncio workers + تحليل ثابت + تقرير AI.
 
 التشغيل:
-    pip install fastapi uvicorn[standard] sqlalchemy aiofiles anthropic openai python-multipart
-    python allinone.py
+    pip install fastapi "uvicorn[standard]" sqlalchemy aiofiles \
+        python-multipart anthropic openai
+    python3 allinone.py
 
-الوصول:
-    http://localhost:8000         ← الداشبورد
-    http://localhost:8000/api/*   ← الـ API
-
-المتغيرات البيئية (اختيارية):
-    PORT=8000
-    DEOBF_ROOT=./deobf
-    STORAGE_DIR=./storage
-    API_KEYS=key1,key2
+المتغيرات البيئية:
+    PORT=8080                          (Fly.io يوفّره)
+    DEOBF_ROOT=/app/deobf
+    STORAGE_DIR=/app/storage
+    API_KEYS=admin
     AI_PROVIDER=anthropic | openai
     ANTHROPIC_API_KEY=sk-ant-xxx
     OPENAI_API_KEY=sk-xxx
@@ -43,10 +40,11 @@ from sqlalchemy import (Column, DateTime, Float, Integer, String, Text,
                         create_engine)
 from sqlalchemy.orm import declarative_base, sessionmaker
 
+
 # ============================================================
 # الإعدادات
 # ============================================================
-PORT            = int(os.environ.get("PORT", "8000"))
+PORT            = int(os.environ.get("PORT", "8080"))
 DEOBF_ROOT      = os.environ.get("DEOBF_ROOT", "./deobf")
 STORAGE_DIR     = os.environ.get("STORAGE_DIR", "./storage")
 MAX_UPLOAD_MB   = int(os.environ.get("MAX_UPLOAD_MB", "100"))
@@ -102,7 +100,7 @@ Base.metadata.create_all(engine)
 # ============================================================
 class LocalPubSub:
     def __init__(self):
-        self.subs = {}   # job_id -> list[asyncio.Queue]
+        self.subs = {}
 
     def subscribe(self, job_id: str) -> asyncio.Queue:
         q = asyncio.Queue()
@@ -127,6 +125,7 @@ BUS = LocalPubSub()
 
 
 def publish(job_id: str, **kw):
+    """يحدّث قاعدة البيانات + يبث على المشتركين."""
     with SessionLocal() as db:
         j = db.get(Job, job_id)
         if j:
@@ -135,10 +134,10 @@ def publish(job_id: str, **kw):
                     setattr(j, k, v)
             db.commit()
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.create_task(BUS.publish(job_id, kw))
-    except Exception:
+        loop = asyncio.get_running_loop()
+        loop.create_task(BUS.publish(job_id, kw))
+    except RuntimeError:
+        # (من subprocess/thread بلا loop) — نتجاهل، الواجهة تعتمد على polling
         pass
 
 
@@ -268,7 +267,8 @@ def chunk_source(text: str, max_chars: int = 12000):
         cur.append(ln)
         size += len(ln) + 1
         if size >= max_chars and (not ln.strip() or ln.startswith(("local ", "function ", "end"))):
-            chunks.append("\n".join(cur)); cur, size = [], 0
+            chunks.append("\n".join(cur))
+            cur, size = [], 0
     if cur:
         chunks.append("\n".join(cur))
     return chunks
@@ -314,7 +314,7 @@ def ai_report(source: str, static: dict, filename: str) -> str:
 
 
 # ============================================================
-# مهمة التفكيك (asyncio، بلا Celery)
+# مهمة التفكيك
 # ============================================================
 async def run_job(job_id: str):
     with SessionLocal() as db:
@@ -331,11 +331,13 @@ async def run_job(job_id: str):
 
     publish(job_id, status="running", stage="كشف", progress=2)
 
-    # detect
+    # --- كشف نوع التشويش
     obf = "unknown"
     try:
-        d = subprocess.run([sys.executable, os.path.join(DEOBF_ROOT, "deob.py"),
-                            inp, "--detect"], capture_output=True, text=True, timeout=60)
+        d = subprocess.run(
+            [sys.executable, os.path.join(DEOBF_ROOT, "deob.py"), inp, "--detect"],
+            capture_output=True, text=True, timeout=60,
+        )
         parts = (d.stdout.strip().splitlines()[-1] if d.stdout.strip() else "").split("\t")
         if parts:
             obf = parts[0]
@@ -343,39 +345,55 @@ async def run_job(job_id: str):
         pass
     publish(job_id, obfuscator=obf, stage="تفكيك", progress=5)
 
-    # deobf
-    cmd = [sys.executable, os.path.join(DEOBF_ROOT, "deob.py"),
-           inp, "-o", out,
-           "--timeout", str(MAX_RUNTIME_SEC),
-           "--budget", str(MAX_RUNTIME_SEC - 60),
-           "--devirt-rounds", "200"]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-    async for raw in proc.stdout:
-        line = raw.decode("utf-8", "replace").rstrip()
-        m = re.search(r"round (\d+)", line)
-        if m:
-            publish(job_id, stage=f"جولة {m.group(1)}", progress=min(70, 5 + int(m.group(1)) // 3))
-        if time.time() - t0 > MAX_RUNTIME_SEC:
-            proc.kill()
-            publish(job_id, status="failed", stage="مهلة",
-                    error=f"تجاوز {MAX_RUNTIME_SEC} ثانية")
-            return
-    await proc.wait()
+    # --- تفكيك
+    cmd = [
+        sys.executable, os.path.join(DEOBF_ROOT, "deob.py"),
+        inp, "-o", out,
+        "--timeout", str(MAX_RUNTIME_SEC),
+        "--budget", str(MAX_RUNTIME_SEC - 60),
+        "--devirt-rounds", "200",
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        async for raw in proc.stdout:
+            line = raw.decode("utf-8", "replace").rstrip()
+            m = re.search(r"round (\d+)", line)
+            if m:
+                pct = min(70, 5 + int(m.group(1)) // 3)
+                publish(job_id, stage=f"جولة {m.group(1)}", progress=pct)
+            if time.time() - t0 > MAX_RUNTIME_SEC:
+                proc.kill()
+                publish(job_id, status="failed", stage="مهلة",
+                        error=f"تجاوز {MAX_RUNTIME_SEC} ثانية")
+                return
+        await proc.wait()
+    except Exception as e:
+        publish(job_id, status="failed", stage="خطأ", error=str(e)[:500])
+        return
+
     if proc.returncode != 0 or not Path(out).exists():
         publish(job_id, status="failed", stage="تفكيك",
                 error=f"deob.py فشل برمز {proc.returncode}")
         return
 
-    # static analysis
+    # --- تحليل ثابت
     publish(job_id, stage="تحليل ثابت", progress=75)
-    with open(out, encoding="utf-8", errors="replace") as f:
-        source = f.read()
+    try:
+        with open(out, encoding="utf-8", errors="replace") as f:
+            source = f.read()
+    except Exception as e:
+        publish(job_id, status="failed", stage="قراءة", error=str(e))
+        return
+
     static = analyze_source(source)
     with open(rep_path, "w", encoding="utf-8") as f:
         json.dump(static, f, ensure_ascii=False, indent=2)
 
-    # AI report
+    # --- تقرير AI
     has_ai = ((AI_PROVIDER == "anthropic" and ANTHROPIC_API_KEY) or
               (AI_PROVIDER == "openai" and OPENAI_API_KEY))
     if has_ai:
@@ -391,21 +409,82 @@ async def run_job(job_id: str):
         with open(ai_path, "w", encoding="utf-8") as f:
             f.write("# AI معطّل (لا يوجد مفتاح API)\n")
 
-    publish(job_id, status="done", stage="تم", progress=100,
-            output_path=out, output_size=os.path.getsize(out),
-            report_path=rep_path, ai_report_path=ai_path,
-            runtime_sec=time.time() - t0,
-            analysis_json=json.dumps(static, ensure_ascii=False))
+    # --- انتهى
+    publish(
+        job_id,
+        status="done",
+        stage="تم",
+        progress=100,
+        output_path=out,
+        output_size=os.path.getsize(out),
+        report_path=rep_path,
+        ai_report_path=ai_path,
+        runtime_sec=time.time() - t0,
+        analysis_json=json.dumps(static, ensure_ascii=False),
+    )
 
 
 # ============================================================
 # FastAPI
 # ============================================================
-app = FastAPI(title="مفكك Luraph AI")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
-                   allow_headers=["*"])
+app = FastAPI(title="مفكك Luraph AI", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
+# ------------------------------------------------------------
+# الصفحة الرئيسية
+# ------------------------------------------------------------
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    """يخدم index.html من نفس المجلد، أو صفحة تشخيص بسيطة."""
+    here = Path(__file__).parent
+    for cand in (here / "index.html", here / "static" / "index.html"):
+        if cand.exists():
+            return HTMLResponse(cand.read_text(encoding="utf-8"))
+    return HTMLResponse("""<!doctype html>
+<html lang="ar" dir="rtl"><head><meta charset="utf-8">
+<title>مفكك Luraph AI</title>
+<style>body{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:40px}
+code{background:#161b22;padding:2px 6px;border-radius:3px;color:#79c0ff}
+a{color:#58a6ff}</style></head><body>
+<h1>مفكك Luraph AI</h1>
+<p>الخادم يعمل. لكن <code>index.html</code> غير موجود بجانب <code>allinone.py</code>.</p>
+<p>تحقق من:</p>
+<ul>
+  <li><a href="/api/health">/api/health</a> — صحة الخادم</li>
+  <li><a href="/docs">/docs</a> — توثيق API</li>
+</ul>
+</body></html>""")
+
+
+# ------------------------------------------------------------
+# الصحة
+# ------------------------------------------------------------
+@app.get("/api/health")
+def health():
+    return {
+        "ok": True,
+        "version": "1.0.0",
+        "deobf_root": os.path.abspath(DEOBF_ROOT),
+        "deobf_exists": os.path.exists(os.path.join(DEOBF_ROOT, "deob.py")),
+        "storage": os.path.abspath(STORAGE_DIR),
+        "ai_provider": AI_PROVIDER,
+        "ai_model": AI_MODEL,
+        "ai_enabled": bool(
+            (AI_PROVIDER == "anthropic" and ANTHROPIC_API_KEY) or
+            (AI_PROVIDER == "openai" and OPENAI_API_KEY)
+        ),
+    }
+
+
+# ------------------------------------------------------------
+# مساعدة المصادقة
+# ------------------------------------------------------------
 def require_key(x_api_key: str = Header(default=""), k: str = ""):
     supplied = x_api_key or k
     if API_KEYS and supplied not in API_KEYS:
@@ -413,30 +492,14 @@ def require_key(x_api_key: str = Header(default=""), k: str = ""):
     return supplied or "anonymous"
 
 
-# ----- الصفحة الرئيسية -----
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    # يخدم index.html من نفس المجلد؛ لو غير موجود، صفحة احتياطية
-    here = Path(__file__).parent
-    for cand in (here / "index.html", here / "static" / "index.html"):
-        if cand.exists():
-            return HTMLResponse(cand.read_text(encoding="utf-8"))
-    return HTMLResponse("""<!doctype html><html><body style="background:#0d1117;color:#c9d1d9;
-    font-family:monospace;padding:40px">
-    <h1>مفكك Luraph AI</h1>
-    <p>ضع ملف <code>index.html</code> بجانب <code>allinone.py</code> أو استخدم
-    <code>http://host:8000/api/health</code> للتأكد من عمل الباكند.</p>
-    </body></html>""")
-
-
-@app.get("/api/health")
-def health():
-    return {"ok": True, "version": "1.0.0"}
-
-
+# ------------------------------------------------------------
+# الرفع
+# ------------------------------------------------------------
 @app.post("/api/upload")
-async def upload(file: UploadFile = File(...), k: str = "", x_api_key: str = Header(default="")):
+async def upload(file: UploadFile = File(...), k: str = "",
+                 x_api_key: str = Header(default="")):
     require_key(x_api_key, k)
+
     if file.size and file.size > MAX_UPLOAD_MB * 1024 * 1024:
         raise HTTPException(413, f"الملف أكبر من {MAX_UPLOAD_MB} ميغا")
     if not file.filename.lower().endswith((".lua", ".luau", ".txt")):
@@ -444,7 +507,9 @@ async def upload(file: UploadFile = File(...), k: str = "", x_api_key: str = Hea
 
     with SessionLocal() as db:
         job = Job(input_name=file.filename, input_size=0, input_path="")
-        db.add(job); db.commit(); db.refresh(job)
+        db.add(job)
+        db.commit()
+        db.refresh(job)
         job_id = job.id
 
     safe = re.sub(r"[^\w.\-]", "_", file.filename)[:120]
@@ -458,19 +523,31 @@ async def upload(file: UploadFile = File(...), k: str = "", x_api_key: str = Hea
             size += len(chunk)
             if size > MAX_UPLOAD_MB * 1024 * 1024:
                 await f.close()
-                try: os.remove(path)
-                except Exception: pass
-                raise HTTPException(413, "الملف كبير")
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+                with SessionLocal() as db:
+                    j = db.get(Job, job_id)
+                    if j:
+                        db.delete(j)
+                        db.commit()
+                raise HTTPException(413, f"الملف أكبر من {MAX_UPLOAD_MB} ميغا")
             await f.write(chunk)
 
     with SessionLocal() as db:
         j = db.get(Job, job_id)
-        j.input_path = path; j.input_size = size; db.commit()
+        j.input_path = path
+        j.input_size = size
+        db.commit()
 
     asyncio.create_task(run_job(job_id))
     return {"id": job_id, "status": "queued"}
 
 
+# ------------------------------------------------------------
+# المهام
+# ------------------------------------------------------------
 def _job_dict(j: Job) -> dict:
     out = {}
     for c in j.__table__.columns:
@@ -494,7 +571,8 @@ def get_job(job_id: str, k: str = "", x_api_key: str = Header(default="")):
     require_key(x_api_key, k)
     with SessionLocal() as db:
         r = db.get(Job, job_id)
-        if not r: raise HTTPException(404)
+        if not r:
+            raise HTTPException(404, "لا يوجد هذا العنصر")
         return _job_dict(r)
 
 
@@ -504,8 +582,9 @@ def get_source(job_id: str, k: str = "", x_api_key: str = Header(default="")):
     with SessionLocal() as db:
         r = db.get(Job, job_id)
         if not r or not r.output_path or not os.path.exists(r.output_path):
-            raise HTTPException(404, "لم يكتمل")
-        return open(r.output_path, encoding="utf-8", errors="replace").read()
+            raise HTTPException(404, "لم يكتمل التفكيك")
+        with open(r.output_path, encoding="utf-8", errors="replace") as f:
+            return f.read()
 
 
 @app.get("/api/jobs/{job_id}/source/download")
@@ -514,9 +593,12 @@ def download_source(job_id: str, k: str = "", x_api_key: str = Header(default=""
     with SessionLocal() as db:
         r = db.get(Job, job_id)
         if not r or not r.output_path or not os.path.exists(r.output_path):
-            raise HTTPException(404)
-        return FileResponse(r.output_path, media_type="text/plain",
-                            filename=f"{r.input_name}.devirt.luau")
+            raise HTTPException(404, "لم يكتمل التفكيك")
+        return FileResponse(
+            r.output_path,
+            media_type="text/plain",
+            filename=f"{r.input_name}.devirt.luau",
+        )
 
 
 @app.get("/api/jobs/{job_id}/report", response_class=PlainTextResponse)
@@ -525,8 +607,9 @@ def get_report(job_id: str, k: str = "", x_api_key: str = Header(default="")):
     with SessionLocal() as db:
         r = db.get(Job, job_id)
         if not r or not r.ai_report_path or not os.path.exists(r.ai_report_path):
-            raise HTTPException(404)
-        return open(r.ai_report_path, encoding="utf-8").read()
+            raise HTTPException(404, "لا يوجد تقرير")
+        with open(r.ai_report_path, encoding="utf-8") as f:
+            return f.read()
 
 
 @app.get("/api/jobs/{job_id}/analysis")
@@ -535,18 +618,20 @@ def get_analysis(job_id: str, k: str = "", x_api_key: str = Header(default="")):
     with SessionLocal() as db:
         r = db.get(Job, job_id)
         if not r or not r.analysis_json:
-            raise HTTPException(404)
+            raise HTTPException(404, "لا يوجد تحليل")
         return json.loads(r.analysis_json)
 
 
 @app.post("/api/jobs/{job_id}/chat")
-async def chat(job_id: str, body: dict, k: str = "", x_api_key: str = Header(default="")):
+async def chat(job_id: str, body: dict, k: str = "",
+               x_api_key: str = Header(default="")):
     require_key(x_api_key, k)
     with SessionLocal() as db:
         r = db.get(Job, job_id)
         if not r or not r.output_path or not os.path.exists(r.output_path):
-            raise HTTPException(404)
-        source = open(r.output_path, encoding="utf-8", errors="replace").read()
+            raise HTTPException(404, "لم يكتمل التفكيك")
+        with open(r.output_path, encoding="utf-8", errors="replace") as f:
+            source = f.read()
     q = (body.get("q") or "").strip()
     if not q:
         raise HTTPException(400, "سؤال فارغ")
@@ -555,13 +640,39 @@ async def chat(job_id: str, body: dict, k: str = "", x_api_key: str = Header(def
     scored = sorted(chunks, key=lambda c: -len(qw & set(re.findall(r"\w+", c.lower()))))[:3]
     ctx = "\n\n".join(f"```luau\n{c}\n```" for c in scored)
     try:
-        ans = await asyncio.to_thread(call_ai, AI_SYSTEM,
-            f"السؤال: {q}\n\nالكود:\n{ctx}\n\nأجب مع مراجع الكود.", 2000)
+        ans = await asyncio.to_thread(
+            call_ai, AI_SYSTEM,
+            f"السؤال: {q}\n\nالكود:\n{ctx}\n\nأجب مع مراجع الكود.", 2000,
+        )
     except Exception as e:
         raise HTTPException(502, f"AI: {e}")
     return {"answer": ans}
 
 
+@app.delete("/api/jobs/{job_id}")
+def delete_job(job_id: str, confirm: str = "", k: str = "",
+               x_api_key: str = Header(default="")):
+    require_key(x_api_key, k)
+    if confirm != "yes":
+        raise HTTPException(400, "أضف ?confirm=yes للتأكيد")
+    with SessionLocal() as db:
+        r = db.get(Job, job_id)
+        if not r:
+            raise HTTPException(404)
+        for p in (r.input_path, r.output_path, r.report_path, r.ai_report_path):
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+        db.delete(r)
+        db.commit()
+    return {"deleted": job_id}
+
+
+# ------------------------------------------------------------
+# WebSocket
+# ------------------------------------------------------------
 @app.websocket("/ws/jobs/{job_id}")
 async def ws_job(ws: WebSocket, job_id: str):
     await ws.accept()
@@ -570,7 +681,8 @@ async def ws_job(ws: WebSocket, job_id: str):
         if r:
             await ws.send_text(json.dumps({
                 "status": r.status, "stage": r.stage,
-                "progress": r.progress, "error": r.error}, ensure_ascii=False))
+                "progress": r.progress, "error": r.error,
+            }, ensure_ascii=False))
     q = BUS.subscribe(job_id)
     try:
         while True:
@@ -596,4 +708,5 @@ if __name__ == "__main__":
     print(f"  DEOBF_ROOT = {os.path.abspath(DEOBF_ROOT)}")
     print(f"  STORAGE    = {os.path.abspath(STORAGE_DIR)}")
     print(f"  AI         = {AI_PROVIDER} / {AI_MODEL}")
+    print(f"  AI enabled = {bool((AI_PROVIDER == 'anthropic' and ANTHROPIC_API_KEY) or (AI_PROVIDER == 'openai' and OPENAI_API_KEY))}")
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
