@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<title>لوحة التحكم</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:system-ui}
+body{display:flex;min-height:100vh;background:#f4f4f5}
+aside{width:240px;background:#18181b;color:#fff;padding:20px}
+aside h2{margin-bottom:20px;font-size:18px}
+aside ul{list-style:none}
+aside li{padding:10px;border-radius:6px;cursor:pointer;margin-bottom:4px}
+aside li:hover,aside li.active{background:#27272a}
+main{flex:1;padding:30px}
+h1{font-size:22px;margin-bottom:20px}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+.card{background:#fff;padding:20px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.card p{color:#71717a;font-size:14px}
+.card b{display:block;font-size:28px;margin-top:8px}
+</style>
+</head>
+<body>
+<aside>
+  <h2>لوحة التحكم</h2>
+  <ul>
+    <li class="active">الرئيسية</li>
+    <li>المستخدمون</li>
+    <li>الإعدادات</li>
+  </ul>
+</aside>
+<main>
+  <h1>نظرة عامة</h1>
+  <div class="grid">
+    <div class="card"><p>المستخدمون</p><b id="u">-</b></div>
+    <div class="card"><p>الطلبات</p><b id="o">-</b></div>
+    <div class="card"><p>الإيرادات</p><b id="r">-</b></div>
+  </div>
+</main>
+<script>
+fetch("/api/stats").then(r=>r.json()).then(d=>{
+  document.getElementById("u").textContent = d.users.toLocaleString();
+  document.getElementById("o").textContent = d.orders.toLocaleString();
+  document.getElementById("r").textContent = "$" + d.revenue.toLocaleString();
+});
+</script>
+</body>
+</html>
