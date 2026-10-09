@@ -1,0 +1,135 @@
+-- Services
+local CoreGui = game:GetService("CoreGui")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+-- إزالة الواجهة القديمة إذا كانت موجودة لمنع التكرار
+if CoreGui:FindFirstChild("ModernAutoPlayGUI") then
+    CoreGui.ModernAutoPlayGUI:Destroy()
+end
+
+-- إنشاء ScreenGui الرئيسي
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "ModernAutoPlayGUI"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = CoreGui
+
+-- الإطار الرئيسي للقائمة (تصميم مودرن وبسيط)
+local mainFrame = Instance.new("Frame")
+mainFrame.Name = "MainFrame"
+mainFrame.Size = UDim2.new(0, 260, 0, 140)
+mainFrame.Position = UDim2.new(0.5, -130, 0.4, -70)
+mainFrame.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.Draggable = true -- يمكنك تحريك القائمة في أي مكان بالشاشة
+mainFrame.Parent = screenGui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 14)
+corner.Parent = mainFrame
+
+-- شريط العنوان
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Size = UDim2.new(1, 0, 0, 45)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Text = "⚡ لوحة Auto Play"
+titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+titleLabel.TextSize = 14
+titleLabel.Font = Enum.Font.GothamBold
+titleLabel.Parent = mainFrame
+
+-- دالة البحث والتحقق من العناصر المرئية
+local function isActuallyVisible(obj)
+    if not obj or obj.Parent == nil then return false end
+    if obj:IsA("GuiObject") and not obj.Visible then return false end
+    local current = obj.Parent
+    while current and current ~= game do
+        if current:IsA("GuiObject") and not current.Visible then return false end
+        if current:IsA("ScreenGui") and current.Enabled == false then return false end
+        current = current.Parent
+    end
+    return true
+end
+
+-- دالة الضغط على الأزرار
+local function fireButton(btn)
+    if not btn or not btn.Parent or not isActuallyVisible(btn) then return end
+    pcall(function()
+        if firesignal then
+            firesignal(btn.MouseButton1Click)
+            firesignal(btn.Activated)
+        end
+        if getconnections then
+            for _, conn in ipairs(getconnections(btn.MouseButton1Click)) do conn:Fire() end
+            for _, conn in ipairs(getconnections(btn.Activated)) do conn:Fire() end
+        end
+    end)
+end
+
+-- زر التفعيل (Toggle) مودرن
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Size = UDim2.new(1, -30, 0, 45)
+toggleBtn.Position = UDim2.new(0, 15, 0, 65)
+toggleBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 65)
+toggleBtn.BorderSizePixel = 0
+toggleBtn.Text = "Auto Play: متوقف"
+toggleBtn.TextColor3 = Color3.fromRGB(255, 90, 90)
+toggleBtn.TextSize = 13
+toggleBtn.Font = Enum.Font.GothamBold
+toggleBtn.Parent = mainFrame
+
+local btnCorner = Instance.new("UICorner")
+btnCorner.CornerRadius = UDim.new(0, 10)
+btnCorner.Parent = toggleBtn
+
+local autoPlayActive = false
+
+-- التحكم بتشغيل أو إيقاف الأوتو بلاي من الزر
+toggleBtn.MouseButton1Click:Connect(function()
+    autoPlayActive = not autoPlayActive
+    if autoPlayActive then
+        toggleBtn.Text = "Auto Play: شغال 🚀"
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(46, 204, 113)
+        toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    else
+        toggleBtn.Text = "Auto Play: متوقف"
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 65)
+        toggleBtn.TextColor3 = Color3.fromRGB(255, 90, 90)
+    end
+end)
+
+-- حلقة البحث التلقائي والضغط على Play و Skip مع التأخير المطلوب للجوال
+task.spawn(function()
+    while true do
+        if autoPlayActive then
+            pcall(function()
+                local holders = { LocalPlayer:FindFirstChild("PlayerGui"), CoreGui }
+                for _, holder in ipairs(holders) do
+                    if holder then
+                        for _, obj in ipairs(holder:GetDescendants()) do
+                            if (obj:IsA("TextButton") or obj:IsA("ImageButton")) and isActuallyVisible(obj) then
+                                local nameUp = string.upper(obj.Name)
+                                
+                                -- الضغط على زر Play
+                                if nameUp == "PLAYBUTTON" then
+                                    fireButton(obj)
+                                end
+                                
+                                -- الضغط على زر Skip مع تأخير بسيط يناسب أداء الجوال
+                                if nameUp == "AVATARMENUSKIPBUTTON" then
+                                    task.wait(0.5)
+                                    fireButton(obj)
+                                end
+                            end
+                        end
+                    end
+                end
+            end)
+        end
+        task.wait(1)
+    end
+end)
+
+print("✅ تمت دمج القائمة المودرن مع Auto Play بنجاح!")
